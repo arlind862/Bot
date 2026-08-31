@@ -136,12 +136,12 @@ _ID_DEF={
     "CALL_VOICE_CHANNEL_ID":CALL_VOICE_CHANNEL_ID,
 }
 _MSG_DEF={
-    "WELCOME_MSG":"Hey {mention},\n\nWelcome to **Corazon**!\nPlease read the rules: <#{rules}>\n\n- Be respectful\n- Have fun!",
+    "WELCOME_MSG":"Hey {mention},\n\nWillkommen in **Avon**!\nBitte lies dir das: <#{rules}>\n\n- Sei Respektvoll\n- Hab Spaß!",
     "BOOST_MSG":"thank you ",
     "TICKET_PANEL_DESC":"Click the button below to open a support ticket.",
     "TICKET_OPEN_MSG":"Please describe your issue and a staff member will assist you shortly.",
     "INVITE_VANITY_MSG":"**{member}** ist über den **Vanity-Link** beigetreten.",
-    "INVITE_KNOWN_MSG":"**{member}** ist dem Server beigetreten.\nEingeladen von **{inviter}** — jetzt **{real} Einladungen**.",
+    "INVITE_KNOWN_MSG":"**{member}** ist dem Server beigetreten.\nEingeladen von **{inviter}** jetzt **{real} Einladungen**.",
     "INVITE_UNKNOWN_MSG":"**{member}** ist beigetreten. Einladender unbekannt.",
     "FIRST_REACT_MSG":"{mention} war der Erste! 🏆",
     "TICKET_CLOSE_MSG":"Dieses Ticket wurde geschlossen. Nur Staff-Mitglieder können diesen Kanal sehen.",
