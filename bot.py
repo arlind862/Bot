@@ -136,7 +136,7 @@ _ID_DEF={
     "CALL_VOICE_CHANNEL_ID":CALL_VOICE_CHANNEL_ID,
 }
 _MSG_DEF={
-    "WELCOME_MSG":"Hey {mention},\n\nWillkommen in *Akhis**!\nBitte lies dir das: <#{rules}>\n\n- Sei Respektvoll\n- Hab Spaß!",
+    "WELCOME_MSG":"Hey {mention},\n\nWillkommen in **Akhis**!\nBitte lies dir das: <#{rules}>\n\n- Sei Respektvoll\n- Hab Spaß!",
     "BOOST_MSG":"thank you ",
     "TICKET_PANEL_DESC":"Click the button below to open a support ticket.",
     "TICKET_OPEN_MSG":"Please describe your issue and a staff member will assist you shortly.",
