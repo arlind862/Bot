@@ -85,9 +85,7 @@ VALID_PUNISHMENTS = ["none", "clear_roles", "timeout", "kick", "ban"]
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 NIGHT_MODE_ROLES = [
-    1516514623413813488,
-    1516453412106014851,
-    1516457574151749724,
+    1544817960940601434  
 ]
 # role_id -> saved permissions dict: {perm_name: bool}
 _night_saved_perms: dict[int, dict] = {}
