@@ -63,7 +63,7 @@ SEC_PUNISHMENT_DEFAULTS = {
     "role_spam":   "ban",
     "webhook":     "ban",
     "admin_perm":  "kick",
-    "bot_add":     "ban",
+    "bot_add":     "",
 }
 SEC_PUNISHMENT_LABELS = {
     "spam":        "Spam (zu viele Nachrichten)",
