@@ -1,4 +1,4 @@
-import sqlite3, discord, asyncio, os, re, pathlib
+import sqlite3, discord, asyncio, os, re, pathlib, aiohttp
 from discord.ext import commands
 from discord.ui import View, Button
 from collections import defaultdict
@@ -31,13 +31,14 @@ VOICE_ALWAYS_ON          = True
 SPAM_MAX=5; SPAM_INTERVAL=3; SPAM_TIMEOUT=300; MENTION_MAX=3; CREATE_MAX=3; CREATE_WIN=15
 PING_MAX=2; PING_WINDOW=5
 INVITE_RE = re.compile(r"(discord\.gg|discord\.com/invite)/\S+", re.IGNORECASE)
+# Kept for backwards compatibility — real whitelist now lives in the sec_whitelist DB table (per guild).
 SECURITY_WHITELIST_USERS: set[int] = set()
 SECURITY_WHITELIST_ROLES: set[int] = set()
 SECURITY_MODULES = [
     "anti_spam","anti_mention","anti_invite","anti_webhook",
     "anti_channel_delete","anti_channel_create","anti_role_delete","anti_role_create",
     "anti_mass_ban","anti_mass_kick","anti_mass_timeout","anti_admin_perm","new_account_warn",
-    "anti_mass_ping",
+    "anti_mass_ping","anti_bot_add",
 ]
 
 # ================================================================
@@ -56,14 +57,14 @@ SEC_PUNISHMENT_DEFAULTS = {
     "invite_spam": "timeout",
     "mass_ban":    "ban",
     "mass_kick":   "ban",
-    "mass_timeout":"ban",
+    "mass_timeout":"clear_roles",  # wer mehrere Leute hintereinander timeoutet, verliert seine Rollen
     "channel_del": "ban",
     "channel_spam":"ban",
     "role_del":    "ban",
     "role_spam":   "ban",
     "webhook":     "ban",
-    "admin_perm":  "kick",
-    "bot_add":     "",
+    "admin_perm":  "ban",          # wer Admin an eine Rolle vergibt, wird gebannt (Admin wird zusätzlich sofort entfernt)
+    "bot_add":     "kick",
 }
 SEC_PUNISHMENT_LABELS = {
     "spam":        "Spam (zu viele Nachrichten)",
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS night_roles(guild_id INT,role_id INT,PRIMARY KEY(guil
 CREATE TABLE IF NOT EXISTS night_saved_perms(guild_id INT,role_id INT,perm_name TEXT,perm_value INT,PRIMARY KEY(guild_id,role_id,perm_name));
 CREATE TABLE IF NOT EXISTS night_mode_state(guild_id INT PRIMARY KEY,enabled INT DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sec_punishments(guild_id INT,event TEXT,punishment TEXT,PRIMARY KEY(guild_id,event));
+CREATE TABLE IF NOT EXISTS sec_whitelist(guild_id INT,user_id INT,PRIMARY KEY(guild_id,user_id));
 """); _db.commit()
 
 _ID_DEF={
@@ -231,6 +233,12 @@ def _sec_punishment_get(g, event: str) -> str:
 def _sec_punishment_set(g, event: str, punishment: str):
     _cur.execute("INSERT INTO sec_punishments(guild_id,event,punishment)VALUES(?,?,?)ON CONFLICT(guild_id,event)DO UPDATE SET punishment=?",(g,event,punishment,punishment)); _db.commit()
 
+# ---- Security whitelist (persistent, per guild) ----
+def _wl_add(g,u): _cur.execute("INSERT OR IGNORE INTO sec_whitelist(guild_id,user_id)VALUES(?,?)",(g,u)); _db.commit()
+def _wl_remove(g,u): _cur.execute("DELETE FROM sec_whitelist WHERE guild_id=? AND user_id=?",(g,u)); _db.commit(); return _cur.rowcount>0
+def _wl_list(g): _cur.execute("SELECT user_id FROM sec_whitelist WHERE guild_id=?",(g,)); return [r[0] for r in _cur.fetchall()]
+def _wl_check(g,u): _cur.execute("SELECT 1 FROM sec_whitelist WHERE guild_id=? AND user_id=?",(g,u)); return _cur.fetchone() is not None
+
 # ================================================================
 #  HELPERS
 # ================================================================
@@ -246,23 +254,45 @@ def can_timeout(m):
     if m.id in OWNERS: return True
     if can_mod(m): return True
     tid=_cid(m.guild.id,"TIMEOUT_ROLE_ID"); return tid!=0 and any(r.id==tid for r in m.roles)
-def whitelisted(m):
+def whitelisted(m, guild=None):
+    """Check if a user/member is exempt from security auto-punishments.
+    Exempt: bot owners, the guild owner, anyone on the persistent per-guild
+    security whitelist, whitelisted roles, and staff whose top role outranks the bot."""
     if not m: return False
-    if getattr(m,"id",None) in OWNERS: return True
-    if getattr(m,"id",None) in SECURITY_WHITELIST_USERS: return True
+    uid = getattr(m, "id", None)
+    if uid in OWNERS: return True
+    g = guild or getattr(m, "guild", None)
+    if g:
+        if g.owner_id == uid: return True
+        if _wl_check(g.id, uid): return True
     if hasattr(m,"roles"):
         if any(r.id in SECURITY_WHITELIST_ROLES for r in m.roles): return True
-        g=getattr(m,"guild",None)
-        if g and g.me and m.top_role>=g.me.top_role: return True
+        gg=getattr(m,"guild",None) or g
+        if gg and gg.me and hasattr(m,"top_role") and m.top_role>=gg.me.top_role: return True
     return False
 def new_account(u,days=7): return (datetime.utcnow()-u.created_at.replace(tzinfo=None))<timedelta(days=days)
 def parse_color(c:str)->discord.Color:
     return {"white":discord.Color.from_rgb(255,255,255),"red":discord.Color.from_rgb(220,50,50),
             "green":discord.Color.from_rgb(50,200,50),"blue":discord.Color.from_rgb(50,100,220)
             }.get(c.lower(),discord.Color.from_rgb(0,0,0))
+
+# ---- Flexible, Carl-bot-style duration parsing: "10m", "5min", "2h", "1d", or bare "5" (= 5 minutes) ----
+_TIME_UNITS = {
+    "s":1,"sec":1,"secs":1,"second":1,"seconds":1,
+    "m":60,"min":60,"mins":60,"minute":60,"minutes":60,
+    "h":3600,"hr":3600,"hrs":3600,"hour":3600,"hours":3600,
+    "d":86400,"day":86400,"days":86400,
+}
 def parse_time(s:str):
-    if not s or s[-1].lower() not in "smhd" or not s[:-1].isdigit(): return None
-    return int(s[:-1])*{"s":1,"m":60,"h":3600,"d":86400}[s[-1].lower()]
+    if not s: return None
+    s=s.strip().lower().replace(" ","")
+    m=re.fullmatch(r"(\d+)([a-z]*)",s)
+    if not m: return None
+    num=int(m.group(1)); unit=m.group(2) or "m"
+    mult=_TIME_UNITS.get(unit)
+    if mult is None: return None
+    return num*mult
+
 def eval_math(expr:str):
     import ast as _a
     if not re.fullmatch(r"[\d\s\+\-\*\/\(\)\.]+",expr.strip()): return None
@@ -300,6 +330,62 @@ def find_role(guild,q):
     return ex or [r for r in guild.roles if q.lower() in r.name.lower()]
 def bot_can_act(guild, member):
     return guild.me and member.top_role < guild.me.top_role
+
+# ================================================================
+#  ENGLISH TRANSLATION — 🇺🇸 button helper
+# ================================================================
+# Every message the bot sends can carry a small 🇺🇸 button. Pressing it
+# translates the same content to English and replies ephemerally, so the
+# original message in the channel stays untouched.
+
+async def _translate_text(text: str) -> str | None:
+    if not text: return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            params = {"q": text[:490], "langpair": "de|en"}
+            async with session.get("https://api.mymemory.translated.net/get", params=params,
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200: return None
+                data = await r.json()
+                txt = data.get("responseData", {}).get("translatedText")
+                return txt
+    except Exception:
+        return None
+
+class TranslateButton(discord.ui.Button):
+    """A reusable 🇺🇸 button — attach to any View to let users get an English
+    ephemeral copy of the message content/embed."""
+    def __init__(self, text: str = None, embed: discord.Embed = None, row: int | None = None):
+        super().__init__(emoji="🇺🇸", style=discord.ButtonStyle.secondary, row=row)
+        self.text = text
+        self.embed = embed
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        source = self.text or (self.embed.description if self.embed else None)
+        if not source:
+            return await interaction.followup.send("Nichts zum Übersetzen gefunden.", ephemeral=True)
+        translated = await _translate_text(source)
+        if not translated:
+            return await interaction.followup.send("Übersetzung fehlgeschlagen — bitte später erneut versuchen.", ephemeral=True)
+        if self.embed:
+            emb = discord.Embed(description=translated, color=self.embed.color, title=self.embed.title)
+            await interaction.followup.send(embed=emb, ephemeral=True)
+        else:
+            await interaction.followup.send(translated, ephemeral=True)
+
+class TranslateView(discord.ui.View):
+    """Stand-alone view: just the 🇺🇸 translate button. Use this for plain
+    messages that don't otherwise need buttons."""
+    def __init__(self, text: str = None, embed: discord.Embed = None, timeout: int = 900):
+        super().__init__(timeout=timeout)
+        self.add_item(TranslateButton(text=text, embed=embed))
+
+def add_translate(view: discord.ui.View, text: str = None, embed: discord.Embed = None):
+    """Attach a 🇺🇸 translate button onto an existing view (e.g. a persistent
+    ticket view) so it sits alongside the other buttons."""
+    view.add_item(TranslateButton(text=text, embed=embed))
+    return view
 
 # ================================================================
 #  SECURITY PUNISHMENT EXECUTOR
@@ -631,22 +717,46 @@ async def tracker_cleanup():
         for uid in dead: del mass_ping_tracker[uid]
 
 async def voice_loop():
+    """Keeps the bot connected to CALL_VOICE_CHANNEL_ID. Rewritten to stop the
+    constant leave/rejoin flapping: it no longer tears down a healthy
+    connection just to reconnect, it moves instead of leave+rejoin when it's
+    in the wrong channel, and it uses reconnect=True/self_deaf to be more
+    resilient to brief network hiccups."""
     await bot.wait_until_ready()
     while VOICE_ALWAYS_ON:
         try:
-            ch=bot.get_channel(CALL_VOICE_CHANNEL_ID)
+            ch = bot.get_channel(CALL_VOICE_CHANNEL_ID)
             if ch:
-                vc=discord.utils.get(bot.voice_clients,guild=ch.guild)
-                if vc is None:
-                    try: await ch.connect()
-                    except: pass
-                elif not vc.is_connected():
-                    try: await vc.disconnect()
-                    except: pass
-                    try: await ch.connect()
-                    except: pass
-        except: pass
-        await asyncio.sleep(20)
+                vc = discord.utils.get(bot.voice_clients, guild=ch.guild)
+                if vc is None or not vc.is_connected():
+                    if vc is not None:
+                        try: await vc.disconnect(force=True)
+                        except: pass
+                    try:
+                        await ch.connect(reconnect=True, timeout=30, self_deaf=True)
+                    except Exception as e:
+                        print(f"[voice] connect failed: {e}")
+                elif vc.channel and vc.channel.id != ch.id:
+                    try:
+                        await vc.move_to(ch)
+                    except Exception as e:
+                        print(f"[voice] move failed: {e}")
+        except Exception as e:
+            print(f"[voice] loop error: {e}")
+        await asyncio.sleep(30)
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    # If the bot itself gets forcibly disconnected from the call channel,
+    # rejoin right away instead of waiting up to 30s for the polling loop.
+    if not VOICE_ALWAYS_ON or not bot.user or member.id != bot.user.id: return
+    if before.channel and before.channel.id == CALL_VOICE_CHANNEL_ID and not after.channel:
+        ch = bot.get_channel(CALL_VOICE_CHANNEL_ID)
+        if ch:
+            await asyncio.sleep(2)
+            try:
+                await ch.connect(reconnect=True, timeout=30, self_deaf=True)
+            except: pass
 
 @bot.event
 async def on_invite_create(inv:discord.Invite):
@@ -685,10 +795,10 @@ async def on_member_join(member:discord.Member):
     if wch:
         try:
             raw=_cmsg(member.guild.id,"WELCOME_MSG")
-            await wch.send(
-                embed=discord.Embed(
-                    description=raw.format(mention=member.mention,rules=_cid(member.guild.id,"RULES_CHANNEL_ID")),
-                    color=0x2B2D31),
+            desc=raw.format(mention=member.mention,rules=_cid(member.guild.id,"RULES_CHANNEL_ID"))
+            emb=discord.Embed(description=desc,color=0x2B2D31)
+            view=TranslateView(embed=emb)
+            await wch.send(embed=emb,view=view,
                 allowed_mentions=discord.AllowedMentions(users=True))
         except: pass
 
@@ -713,7 +823,7 @@ async def on_member_join(member:discord.Member):
                     description=_cmsg(member.guild.id,"INVITE_UNKNOWN_MSG").format(member=str(member),mention=member.mention),
                     color=0x2B2D31,timestamp=datetime.utcnow())
             emb.set_thumbnail(url=member.display_avatar.url)
-            await ich.send(embed=emb,allowed_mentions=discord.AllowedMentions(users=True))
+            await ich.send(embed=emb,view=TranslateView(embed=emb),allowed_mentions=discord.AllowedMentions(users=True))
     except: pass
 
 @bot.event
@@ -726,7 +836,7 @@ async def on_member_remove(member:discord.Member):
     e=await audit(member.guild,discord.AuditLogAction.kick,member.id)
     if not e or e.target.id!=member.id: return
     actor=e.user
-    if not actor or whitelisted(member.guild.get_member(actor.id) or actor): return
+    if not actor or whitelisted(member.guild.get_member(actor.id) or actor, member.guild): return
     now=datetime.utcnow()
     kick_tracker[actor.id]=[t for t in kick_tracker[actor.id] if now-t<timedelta(seconds=20)]
     kick_tracker[actor.id].append(now)
@@ -743,7 +853,8 @@ async def on_member_update(before:discord.Member,after:discord.Member):
         if ch:
             try:
                 await asyncio.sleep(5)
-                await ch.send(_cmsg(after.guild.id,"BOOST_MSG"))
+                text=_cmsg(after.guild.id,"BOOST_MSG")
+                await ch.send(text,view=TranslateView(text=text))
             except: pass
     b={r.id for r in before.roles}; a={r.id for r in after.roles}
     tr=_cid(after.guild.id,"TRIGGER_ROLE_ID")
@@ -772,7 +883,7 @@ async def on_message(message:discord.Message):
             except: pass
             return
 
-    if not whitelisted(message.author):
+    if not whitelisted(message.author, g):
         now=datetime.utcnow()
         if _sec(g.id,"anti_spam"):
             spam_tracker[message.author.id].append(now)
@@ -785,7 +896,9 @@ async def on_message(message:discord.Message):
                     def chk(msg): return msg.author.id==message.author.id
                     await message.channel.purge(limit=20,check=chk,bulk=True)
                 except: pass
-                try: await message.channel.send(f"{message.author.mention} Du wurdest wegen Spam bestraft.",delete_after=5)
+                try:
+                    warn_txt=f"{message.author.mention} Du wurdest wegen Spam bestraft."
+                    await message.channel.send(warn_txt,delete_after=8,view=TranslateView(text="You were punished for spamming."))
                 except: pass
                 spam_tracker[message.author.id].clear()
                 await mlog(g,"Auto-Strafe (Spam)",f"{message.author} ({message.author.id}) — Spam erkannt.")
@@ -821,7 +934,7 @@ async def on_message(message:discord.Message):
             return
 
     if message.channel.id in AUTO_REACT_CHANNEL_IDS:
-        emoji="✅" if message.channel.id==ACTIVITY_CHECK_CHANNEL_ID else "✔️"
+        emoji="✅" if message.channel.id==ACTIVITY_CHECK_CHANNEL_ID else "✔"
         try: await message.add_reaction(emoji)
         except: pass
 
@@ -873,7 +986,7 @@ async def handle_counting(message:discord.Message):
             try: await counting_state["delete_notice"].delete()
             except: pass
             counting_state["delete_notice"]=None
-        try: await message.add_reaction("✔️")
+        try: await message.add_reaction("✔")
         except: pass
     else:
         try:
@@ -891,7 +1004,7 @@ async def on_reaction_add(reaction:discord.Reaction,user:discord.User):
     first_react_announced.add(mid)
     try:
         msg = _cmsg(reaction.message.guild.id,"FIRST_REACT_MSG").format(mention=user.mention,user=str(user))
-        await reaction.message.channel.send(msg,allowed_mentions=discord.AllowedMentions(users=True))
+        await reaction.message.channel.send(msg,view=TranslateView(text=msg),allowed_mentions=discord.AllowedMentions(users=True))
     except: pass
 
 # ================================================================
@@ -921,10 +1034,13 @@ class TicketActionView(View):
             await interaction.channel.set_permissions(interaction.guild.default_role, read_messages=False, send_messages=False)
             if sr:
                 await interaction.channel.set_permissions(sr, read_messages=True, send_messages=True)
+            close_text=_cmsg(interaction.guild.id,"TICKET_CLOSE_MSG")
             embed = discord.Embed(
-                description=_cmsg(interaction.guild.id,"TICKET_CLOSE_MSG"),
+                description=close_text,
                 color=0x2B2D31)
-            await interaction.channel.send(embed=embed, view=TicketDeleteView())
+            view=TicketDeleteView()
+            add_translate(view, text=close_text)
+            await interaction.channel.send(embed=embed, view=view)
         except Exception as e:
             await interaction.followup.send(f"Ein Fehler ist aufgetreten: {e}", ephemeral=True)
 
@@ -999,8 +1115,10 @@ class TicketButton(View):
             )
             embed.set_footer(text=f"Geöffnet von {interaction.user}", icon_url=interaction.user.display_avatar.url)
             pings = f"{sr.mention} {interaction.user.mention}" if sr else interaction.user.mention
+            ticket_view=TicketActionView()
+            add_translate(ticket_view, text=open_msg)
             await tc.send(
-                content=pings, embed=embed, view=TicketActionView(),
+                content=pings, embed=embed, view=ticket_view,
                 allowed_mentions=discord.AllowedMentions(roles=True, users=True))
             await interaction.response.send_message(
                 f"Dein Ticket wurde erstellt: {tc.mention}", ephemeral=True)
@@ -1125,8 +1243,10 @@ class SetupMainView(discord.ui.View):
                 return await interaction.response.edit_message(embed=embed, view=_BackToSetupView(g.id))
             panel_desc = _cmsg(g.id, "TICKET_PANEL_DESC")
             embed = discord.Embed(title="Support", description=panel_desc, color=0x2B2D31)
+            panel_view=TicketButton()
+            add_translate(panel_view, text=panel_desc)
             try:
-                await ch.send(embed=embed, view=TicketButton())
+                await ch.send(embed=embed, view=panel_view)
                 await _return_to_setup(interaction, f"Ticket-Panel wurde in {ch.mention} gesendet.")
             except Exception as e:
                 await interaction.response.send_message(f"Fehler: {e}", ephemeral=True)
@@ -1476,7 +1596,8 @@ async def kick(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kei
     if member.top_role>=ctx.guild.me.top_role: return await clean(ctx,"Diese Person hat eine höhere Rolle als ich.")
     try:
         await member.kick(reason=f"{ctx.author}: {reason}")
-        await ctx.send(f"**{member}** wurde von **{ctx.author.name}** gekickt. | {reason}")
+        txt=f"**{member}** wurde von **{ctx.author.name}** gekickt. | {reason}"
+        await ctx.send(txt,view=TranslateView(text=txt))
         await mlog(ctx.guild,"Kick",f"{ctx.author} hat {member} ({member.id}) gekickt. Grund: {reason}")
     except discord.Forbidden: await ctx.send("Ich habe keine Berechtigung, diese Person zu kicken.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
@@ -1490,7 +1611,8 @@ async def ban(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kein
     if member.top_role>=ctx.guild.me.top_role: return await clean(ctx,"Diese Person hat eine höhere Rolle als ich.")
     try:
         await member.ban(reason=f"{ctx.author}: {reason}",delete_message_days=1)
-        await ctx.send(f"**{member}** wurde von **{ctx.author.name}** gebannt. | {reason}")
+        txt=f"**{member}** wurde von **{ctx.author.name}** gebannt. | {reason}"
+        await ctx.send(txt,view=TranslateView(text=txt))
         await mlog(ctx.guild,"Ban",f"{ctx.author} hat {member} ({member.id}) gebannt. Grund: {reason}")
     except discord.Forbidden: await ctx.send("Ich habe keine Berechtigung, diese Person zu bannen.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
@@ -1507,19 +1629,30 @@ async def unban(ctx:commands.Context,user_id:str=None,*,reason:str="Kein Grund a
     except discord.NotFound: await ctx.send("Benutzer nicht gefunden oder nicht gebannt.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
 
+# ---- Timeout / Remove-Timeout — Carl-bot style: duration + reason are both
+# optional and flexible. "?to @user" -> 10 min default. "?to @user 5min" ->
+# 5 min. "?to @user spamming" -> 10 min with "spamming" as the reason.
+# "?to @user 30m spamming" -> 30 min with reason. ----
 @bot.command(aliases=["to"])
 async def timeout(ctx:commands.Context,member:discord.Member=None,duration:str=None,*,reason:str="Kein Grund angegeben"):
     if ctx.guild.id!=ALLOWED_GUILD_ID: return
     if not can_timeout(ctx.author): return await clean(ctx,"Keine Berechtigung.")
-    if not member or not duration: return await clean(ctx,"Verwendung: `?timeout @user <Dauer> [Grund]` — z.B. 10m, 2h, 1d")
+    if not member: return await clean(ctx,"Verwendung: `?to @user [Dauer] [Grund]` — z.B. `?to @user 5min` (Standard: 10m)")
+    if duration is None:
+        duration="10m"
     secs=parse_time(duration)
-    if secs is None: return await clean(ctx,"Ungültige Dauer. Beispiele: `10m`, `2h`, `1d`")
+    if secs is None:
+        # not a valid duration — treat it as the start of the reason instead
+        reason=f"{duration} {reason}".strip() if reason!="Kein Grund angegeben" else duration
+        duration="10m"; secs=600
     if secs>2419200: return await clean(ctx,"Maximale Timeout-Dauer ist 28 Tage.")
     try:
         until=discord.utils.utcnow()+timedelta(seconds=secs)
         await member.timeout(until,reason=f"{ctx.author}: {reason}")
-        await ctx.send(f"**{member}** wurde für **{duration}** getimeouted. | {reason}")
+        txt=f"**{member}** wurde für **{duration}** getimeouted. | {reason}"
+        await ctx.send(txt,view=TranslateView(text=txt))
         await mlog(ctx.guild,"Timeout",f"{ctx.author} hat {member} ({member.id}) für {duration} getimeouted.")
+        await _track_mass_timeout(ctx.guild, ctx.author)
     except discord.Forbidden: await ctx.send("Keine Berechtigung.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
 
@@ -1541,7 +1674,8 @@ async def warn(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kei
     if not can_mod(ctx.author): return await clean(ctx,"Keine Berechtigung.")
     if not member: return await clean(ctx,"Verwendung: `?warn @user [Grund]`")
     wid=_warn_add(ctx.guild.id,member.id,ctx.author.id,reason); wl=_warn_get(ctx.guild.id,member.id)
-    await ctx.send(f"**{member}** wurde verwarnt (#{wid}, gesamt: {len(wl)}). | {reason}")
+    txt=f"**{member}** wurde verwarnt (#{wid}, gesamt: {len(wl)}). | {reason}"
+    await ctx.send(txt,view=TranslateView(text=txt))
     await mlog(ctx.guild,"Verwarnung",f"{ctx.author} hat {member} ({member.id}) verwarnt — #{wid}. {reason}")
     try:
         await member.send(embed=discord.Embed(title=f"Verwarnung — {ctx.guild.name}",
@@ -1645,11 +1779,56 @@ class RoleCreateView(discord.ui.View):
     @discord.ui.button(label="Abbrechen",style=discord.ButtonStyle.danger,row=1)
     async def cancel(self,interaction:discord.Interaction,button:discord.ui.Button): await interaction.response.edit_message(content="Abgebrochen.",view=None)
 
+# ---- ?role @user (no role given) -> multi-role picker ----
+class RoleMultiSelect(discord.ui.RoleSelect):
+    def __init__(self, author_id: int, member: discord.Member):
+        super().__init__(placeholder="Rollen auswählen (Hinzufügen/Entfernen toggeln)...", min_values=1, max_values=25)
+        self.author_id = author_id
+        self.member = member
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Dieses Menü ist nicht für dich.", ephemeral=True)
+        added=[]; removed=[]; failed=[]
+        for role in self.values:
+            if role >= interaction.guild.me.top_role:
+                failed.append(f"{role.name} (zu hoch für mich)"); continue
+            if role.permissions.administrator and interaction.user.id not in OWNERS:
+                failed.append(f"{role.name} (Admin-Rolle)"); continue
+            if role >= interaction.user.top_role and interaction.user.id not in OWNERS:
+                failed.append(f"{role.name} (höher/gleich deiner Rolle)"); continue
+            try:
+                if role in self.member.roles:
+                    await self.member.remove_roles(role, reason=f"?role Menü von {interaction.user}")
+                    removed.append(role.name)
+                else:
+                    await self.member.add_roles(role, reason=f"?role Menü von {interaction.user}")
+                    added.append(role.name)
+            except:
+                failed.append(role.name)
+        parts=[]
+        if added: parts.append("✅ Hinzugefügt: " + ", ".join(added))
+        if removed: parts.append("➖ Entfernt: " + ", ".join(removed))
+        if failed: parts.append("⚠ Fehlgeschlagen: " + ", ".join(failed))
+        await interaction.response.edit_message(content="\n".join(parts) or "Keine Änderung.", view=None)
+        if added or removed:
+            await mlog(interaction.guild, "Rollen Menü",
+                f"{interaction.user} hat für {self.member} Rollen angepasst — Hinzugefügt: {', '.join(added) or '—'} | Entfernt: {', '.join(removed) or '—'}")
+
+class RoleMultiSelectView(discord.ui.View):
+    def __init__(self, author_id: int, member: discord.Member):
+        super().__init__(timeout=120)
+        self.add_item(RoleMultiSelect(author_id, member))
+
 @bot.command(name="role")
 async def role_cmd(ctx:commands.Context,member:discord.Member=None,*,role_input:str=None):
     if ctx.guild.id!=ALLOWED_GUILD_ID: return
     if not can_role(ctx.author): return await clean(ctx,"Keine Berechtigung.")
-    if not member or not role_input: return await clean(ctx,"Verwendung: `?role @user <Rollenname oder ID>`")
+    if not member: return await clean(ctx,"Verwendung: `?role @user [Rollenname oder ID]` — ohne Rolle öffnet sich eine Auswahl.")
+    if not role_input:
+        view = RoleMultiSelectView(ctx.author.id, member)
+        await ctx.send(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest:", view=view)
+        return
     matches=find_role(ctx.guild,role_input)
     if not matches: return await clean(ctx,f"Keine Rolle gefunden: **{role_input}**.")
     if len(matches)>1: return await clean(ctx,f"Mehrere Rollen gefunden: {', '.join(f'`{r.name}`' for r in matches[:6])} — bitte präziser.",delay=6)
@@ -1781,7 +1960,7 @@ async def call(ctx:commands.Context):
     try:
         vc=ctx.voice_client
         if vc and vc.is_connected(): await vc.move_to(ch)
-        else: await ch.connect()
+        else: await ch.connect(reconnect=True,timeout=30,self_deaf=True)
         await ctx.send("Verbunden.",delete_after=3)
     except Exception as e: await ctx.send(f"Fehler: {e}")
 
@@ -1877,17 +2056,20 @@ async def slash_unban(interaction:discord.Interaction,user_id:str,reason:str="Ke
     except discord.NotFound: await interaction.response.send_message("Nutzer nicht gefunden oder nicht gebannt.",ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
-@bot.tree.command(name="timeout",description="Mitglied timeouten. Dauer: z.B. 10m, 2h, 1d",guild=discord.Object(id=ALLOWED_GUILD_ID))
+@bot.tree.command(name="timeout",description="Mitglied timeouten. Dauer: z.B. 10m, 2h, 1d (Standard 10m)",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def slash_timeout(interaction:discord.Interaction,member:discord.Member,duration:str="10m",reason:str="Kein Grund angegeben"):
     if not can_timeout(interaction.user): return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     secs=parse_time(duration)
-    if secs is None: return await interaction.response.send_message("Ungültige Dauer. Beispiele: `10m`, `2h`, `1d`",ephemeral=True)
+    if secs is None:
+        reason=f"{duration} {reason}".strip() if reason!="Kein Grund angegeben" else duration
+        duration="10m"; secs=600
     if secs>2419200: return await interaction.response.send_message("Maximum ist 28 Tage.",ephemeral=True)
     try:
         until=discord.utils.utcnow()+timedelta(seconds=secs)
         await member.timeout(until,reason=f"{interaction.user}: {reason}")
         await interaction.response.send_message(f"**{member}** wurde für **{duration}** getimeouted. | {reason}")
         await mlog(interaction.guild,"Timeout",f"{interaction.user} hat {member} ({member.id}) für {duration} getimeouted.")
+        await _track_mass_timeout(interaction.guild, interaction.user)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
 @bot.tree.command(name="untimeout",description="Timeout eines Mitglieds aufheben.",guild=discord.Object(id=ALLOWED_GUILD_ID))
@@ -1945,9 +2127,13 @@ async def slash_slowmode(interaction:discord.Interaction,seconds:int,channel:dis
 #  SLASH — ROLES
 # ================================================================
 
-@bot.tree.command(name="role",description="Rolle einem Mitglied zuweisen oder entfernen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
-async def slash_role(interaction:discord.Interaction,member:discord.Member,role:discord.Role):
+@bot.tree.command(name="role",description="Rolle einem Mitglied zuweisen oder entfernen. Ohne Rolle öffnet sich eine Auswahl.",guild=discord.Object(id=ALLOWED_GUILD_ID))
+async def slash_role(interaction:discord.Interaction,member:discord.Member,role:discord.Role=None):
     if not can_role(interaction.user): return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
+    if role is None:
+        view = RoleMultiSelectView(interaction.user.id, member)
+        await interaction.response.send_message(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest:", view=view)
+        return
     if role>=interaction.guild.me.top_role: return await interaction.response.send_message("Diese Rolle ist gleich oder höher als meine höchste Rolle.",ephemeral=True)
     if role.permissions.administrator and interaction.user.id not in OWNERS: return await interaction.response.send_message("Du kannst keine Admin-Rollen vergeben.",ephemeral=True)
     if role>=interaction.user.top_role and interaction.user.id not in OWNERS: return await interaction.response.send_message("Du kannst keine Rolle vergeben, die gleich oder höher als deine eigene ist.",ephemeral=True)
@@ -2132,12 +2318,11 @@ async def bot_edit_cmd(interaction:discord.Interaction,name:str=None,avatar_url:
     if name: kw["username"]=name
     if avatar_url:
         try:
-            import aiohttp
             async with aiohttp.ClientSession() as s:
                 async with s.get(avatar_url) as r:
                     if r.status==200: kw["avatar"]=await r.read()
                     else: return await interaction.followup.send(f"Avatar konnte nicht geladen werden (HTTP {r.status}).",ephemeral=True)
-        except ImportError: return await interaction.followup.send("aiohttp ist nicht installiert.",ephemeral=True)
+        except Exception as e: return await interaction.followup.send(f"Avatar-Download fehlgeschlagen: {e}",ephemeral=True)
     try:
         await bot.user.edit(**kw)
         parts=[]
@@ -2153,17 +2338,18 @@ async def send_cmd(interaction:discord.Interaction,channel:discord.TextChannel,m
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     if image and not image_url: return await interaction.response.send_message("Bitte `image_url` angeben wenn `image` aktiviert ist.",ephemeral=True)
     if link_button and not link_url: return await interaction.response.send_message("Bitte `link_url` angeben wenn `link_button` aktiviert ist.",ephemeral=True)
-    view=discord.utils.MISSING
+    v=discord.ui.View()
     if link_button and link_url:
-        v=discord.ui.View(); v.add_item(discord.ui.Button(label=link_label,url=link_url,style=discord.ButtonStyle.link)); view=v
+        v.add_item(discord.ui.Button(label=link_label,url=link_url,style=discord.ButtonStyle.link))
+    v.add_item(TranslateButton(text=message))
     try:
         if embed:
             emb=discord.Embed(description=message,color=parse_color(color))
             if image and image_url: emb.set_image(url=image_url)
-            await channel.send(embed=emb,view=view if view is not discord.utils.MISSING else discord.utils.MISSING)
+            await channel.send(embed=emb,view=v)
         else:
             content=f"{message}\n{image_url}" if image and image_url else message
-            await channel.send(content,view=view if view is not discord.utils.MISSING else discord.utils.MISSING)
+            await channel.send(content,view=v)
         await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
@@ -2171,32 +2357,53 @@ async def send_cmd(interaction:discord.Interaction,channel:discord.TextChannel,m
 async def say_cmd(interaction:discord.Interaction,channel:discord.TextChannel,text:str):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     try:
-        await channel.send(text); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
+        await channel.send(text,view=TranslateView(text=text)); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
     except discord.Forbidden: await interaction.response.send_message("Keine Berechtigung in diesem Kanal.",ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
-@bot.tree.command(name="whitelist_add",description="Mitglied zur Security-Whitelist hinzufügen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
+@bot.tree.command(name="whitelist_add",description="Mitglied zur Security-Whitelist hinzufügen (auch: darf Bots hinzufügen).",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def wl_add(interaction:discord.Interaction,member:discord.Member):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
-    SECURITY_WHITELIST_USERS.add(member.id)
-    await interaction.response.send_message(f"{member.mention} wurde zur Whitelist hinzugefügt.",ephemeral=True)
+    _wl_add(interaction.guild.id, member.id)
+    await interaction.response.send_message(f"{member.mention} wurde zur Whitelist hinzugefügt und dauerhaft gespeichert.",ephemeral=True)
+    await mlog(interaction.guild,"Whitelist",f"{interaction.user} hat {member} zur Security-Whitelist hinzugefügt.")
 
 @bot.tree.command(name="whitelist_remove",description="Mitglied von der Security-Whitelist entfernen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def wl_remove(interaction:discord.Interaction,member:discord.Member):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
-    SECURITY_WHITELIST_USERS.discard(member.id)
-    await interaction.response.send_message(f"{member.mention} wurde von der Whitelist entfernt.",ephemeral=True)
+    removed=_wl_remove(interaction.guild.id, member.id)
+    if removed:
+        await interaction.response.send_message(f"{member.mention} wurde von der Whitelist entfernt.",ephemeral=True)
+        await mlog(interaction.guild,"Whitelist",f"{interaction.user} hat {member} von der Security-Whitelist entfernt.")
+    else:
+        await interaction.response.send_message(f"{member.mention} war nicht auf der Whitelist.",ephemeral=True)
 
 @bot.tree.command(name="whitelist_list",description="Alle Mitglieder auf der Whitelist anzeigen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
 async def wl_list(interaction:discord.Interaction):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
-    if not SECURITY_WHITELIST_USERS: return await interaction.response.send_message("Die Whitelist ist leer.",ephemeral=True)
-    names=[f"{bot.get_user(uid)} (`{uid}`)" if bot.get_user(uid) else f"Unbekannt (`{uid}`)" for uid in SECURITY_WHITELIST_USERS]
-    await interaction.response.send_message("**Security-Whitelist:**\n"+"\n".join(names),ephemeral=True)
+    ids=_wl_list(interaction.guild.id)
+    if not ids: return await interaction.response.send_message("Die Whitelist ist leer.",ephemeral=True)
+    names=[f"{bot.get_user(uid)} (`{uid}`)" if bot.get_user(uid) else f"Unbekannt (`{uid}`)" for uid in ids]
+    await interaction.response.send_message("**Security-Whitelist (persistent):**\n"+"\n".join(names),ephemeral=True)
 
 # ================================================================
 #  SECURITY EVENTS
 # ================================================================
+
+# Tracks how many people a moderator has timed out back-to-back so mass
+# timeout-abuse (see anti_mass_timeout in on_audit_log_entry_create) and this
+# direct-command path both feed the same punishment.
+async def _track_mass_timeout(guild: discord.Guild, actor: discord.abc.User):
+    if not _sec(guild.id,"anti_mass_timeout"): return
+    if whitelisted(guild.get_member(actor.id) or actor, guild): return
+    now=datetime.utcnow()
+    timeout_tracker[actor.id]=[t for t in timeout_tracker[actor.id] if now-t<timedelta(seconds=15)]
+    timeout_tracker[actor.id].append(now)
+    if len(timeout_tracker[actor.id])>=2:
+        m = guild.get_member(actor.id)
+        await _execute_punishment(guild, m or actor, "mass_timeout", "Mass Timeout (2+ in 15s)")
+        timeout_tracker[actor.id].clear()
+        await mlog(guild,"Auto-Strafe (Mass Timeout)",f"{actor} ({actor.id}) hat 2+ Mitglieder in 15s getimeouted.")
 
 @bot.event
 async def on_guild_channel_delete(channel:discord.abc.GuildChannel):
@@ -2209,7 +2416,7 @@ async def on_guild_channel_delete(channel:discord.abc.GuildChannel):
     e=await audit(channel.guild,discord.AuditLogAction.channel_delete)
     if not e: return
     user=e.user
-    if not user or whitelisted(channel.guild.get_member(user.id) or user): return
+    if not user or whitelisted(channel.guild.get_member(user.id) or user, channel.guild): return
     m = channel.guild.get_member(user.id)
     await _execute_punishment(channel.guild, m or user, "channel_del", f"Kanal gelöscht: #{saved['name']}")
     await mlog(channel.guild,"Auto-Strafe (Kanal-Löschung)",f"{user} ({user.id}) hat #{saved['name']} gelöscht.")
@@ -2231,7 +2438,7 @@ async def on_guild_channel_create(channel:discord.abc.GuildChannel):
     e=await audit(channel.guild,discord.AuditLogAction.channel_create)
     if not e: return
     user=e.user
-    if not user or whitelisted(channel.guild.get_member(user.id) or user): return
+    if not user or whitelisted(channel.guild.get_member(user.id) or user, channel.guild): return
     now=datetime.utcnow()
     channel_create_tracker[user.id]=[t for t in channel_create_tracker[user.id] if now-t<timedelta(seconds=CREATE_WIN)]
     channel_create_tracker[user.id].append(now)
@@ -2250,7 +2457,7 @@ async def on_guild_role_delete(role:discord.Role):
     e=await audit(role.guild,discord.AuditLogAction.role_delete)
     if not e: return
     user=e.user
-    if not user or whitelisted(role.guild.get_member(user.id) or user): return
+    if not user or whitelisted(role.guild.get_member(user.id) or user, role.guild): return
     m = role.guild.get_member(user.id)
     await _execute_punishment(role.guild, m or user, "role_del", f"Rolle gelöscht: {saved['name']}")
     await mlog(role.guild,"Auto-Strafe (Rollen-Löschung)",f"{user} ({user.id}) hat Rolle **{saved['name']}** gelöscht.")
@@ -2266,7 +2473,7 @@ async def on_guild_role_create(role:discord.Role):
     e=await audit(role.guild,discord.AuditLogAction.role_create)
     if not e: return
     user=e.user
-    if not user or whitelisted(role.guild.get_member(user.id) or user): return
+    if not user or whitelisted(role.guild.get_member(user.id) or user, role.guild): return
     now=datetime.utcnow()
     role_create_tracker[user.id]=[t for t in role_create_tracker[user.id] if now-t<timedelta(seconds=CREATE_WIN)]
     role_create_tracker[user.id].append(now)
@@ -2284,7 +2491,7 @@ async def on_webhooks_update(channel:discord.TextChannel):
     e=await audit(channel.guild,discord.AuditLogAction.webhook_create)
     if not e: return
     user=e.user
-    if not user or whitelisted(channel.guild.get_member(user.id) or user): return
+    if not user or whitelisted(channel.guild.get_member(user.id) or user, channel.guild): return
     try:
         for w in await channel.webhooks(): await w.delete()
     except: pass
@@ -2300,7 +2507,7 @@ async def on_member_ban(guild:discord.Guild,user:discord.User):
     e=await audit(guild,discord.AuditLogAction.ban)
     if not e: return
     actor=e.user
-    if not actor or whitelisted(guild.get_member(actor.id) or actor): return
+    if not actor or whitelisted(guild.get_member(actor.id) or actor, guild): return
     now=datetime.utcnow()
     ban_tracker[actor.id]=[t for t in ban_tracker[actor.id] if now-t<timedelta(seconds=20)]
     ban_tracker[actor.id].append(now)
@@ -2315,20 +2522,14 @@ async def on_audit_log_entry_create(entry:discord.AuditLogEntry):
 
     if entry.action==discord.AuditLogAction.member_update and _sec(entry.guild.id,"anti_mass_timeout"):
         actor=entry.user
-        if not actor or whitelisted(entry.guild.get_member(actor.id) or actor): return
+        if not actor or whitelisted(entry.guild.get_member(actor.id) or actor, entry.guild): return
         ch=entry.changes; after={c.key:c.new for c in ch.after} if hasattr(ch,"after") else {}
         if "timed_out_until" in after and after["timed_out_until"] is not None:
-            now=datetime.utcnow()
-            timeout_tracker[actor.id]=[t for t in timeout_tracker[actor.id] if now-t<timedelta(seconds=15)]
-            timeout_tracker[actor.id].append(now)
-            if len(timeout_tracker[actor.id])>=2:
-                m = entry.guild.get_member(actor.id)
-                await _execute_punishment(entry.guild, m or actor, "mass_timeout", "Mass Timeout (2+ in 15s)")
-                await mlog(entry.guild,"Auto-Strafe (Mass Timeout)",f"{actor} ({actor.id}) hat 2+ Mitglieder in 15s getimeouted.")
+            await _track_mass_timeout(entry.guild, actor)
 
     if entry.action==discord.AuditLogAction.role_update and _sec(entry.guild.id,"anti_admin_perm"):
         actor=entry.user
-        if not actor or whitelisted(entry.guild.get_member(actor.id) or actor): return
+        if not actor or whitelisted(entry.guild.get_member(actor.id) or actor, entry.guild): return
         role=entry.target
         if not role or role.position>=entry.guild.me.top_role.position: return
         ap=None
@@ -2336,23 +2537,21 @@ async def on_audit_log_entry_create(entry:discord.AuditLogEntry):
             for c in entry.changes.after:
                 if c.key=="permissions": ap=c.new; break
         if ap and ap.administrator:
+            # 1) strip the admin permission from the role immediately
             try:
                 p=discord.Permissions(ap.value); p.administrator=False
                 await role.edit(permissions=p,reason="Admin-Berechtigung blockiert")
             except: pass
+            # 2) punish the person who granted it (default: ban)
             m=entry.guild.get_member(actor.id)
             if m:
                 await _execute_punishment(entry.guild, m, "admin_perm", "Admin-Berechtigung vergeben")
-                await mlog(entry.guild,"Admin-Berechtigung Blockiert",f"{actor} ({actor.id}) hat versucht, Admin-Berechtigung an **{role.name}** zu vergeben.")
+                await mlog(entry.guild,"Admin-Berechtigung Blockiert",f"{actor} ({actor.id}) hat versucht, Admin-Berechtigung an **{role.name}** zu vergeben — Admin entzogen, Strafe ausgeführt.")
 
     if entry.action==discord.AuditLogAction.guild_update:
         actor=entry.user
         if actor and not actor.bot:
             await mlog(entry.guild,"Server Aktualisiert",f"{actor} ({actor.id}) hat Server-Einstellungen geändert.")
-
-    if entry.action==discord.AuditLogAction.bot_add:
-        actor=entry.user; ba=entry.target
-        await mlog(entry.guild,"Bot Hinzugefügt",f"{actor} ({actor.id}) hat Bot {ba} ({getattr(ba,'id','?')}) hinzugefügt.")
 
 # ================================================================
 #  HELP
@@ -2364,11 +2563,15 @@ async def help_cmd(ctx:commands.Context):
     embed=discord.Embed(title="Befehlsreferenz",color=0x2B2D31,timestamp=datetime.utcnow())
     embed.add_field(name="Moderation",value=(
         "`?kick` `?ban` `?unban` `?unbanall`\n"
-        "`?timeout` `?rto` `?purge` `?slowmode`\n"
+        "`?to @user [Dauer] [Grund]` — Timeout, Standard 10m (z.B. `?to @user 5min`)\n"
+        "`?rto @user` — Timeout entfernen\n"
+        "`?purge` `?slowmode`\n"
         "`?warn` `?warns` `?clearwarn` `?clearwarns`\n"
+        "`?setcount <Zahl>` — Counting-Zähler setzen (nur Owner)\n"
         "Alle auch als Slash-Commands verfügbar."),inline=False)
     embed.add_field(name="Rollen",value=(
-        "`?role @user <Name/ID>` — Rolle togglen\n"
+        "`?role @user` — öffnet eine Auswahl, um mehrere Rollen zu toggeln\n"
+        "`?role @user <Name/ID>` — Rolle direkt togglen\n"
         "`?roleall @role` — Allen zuweisen\n"
         "`?rolecreate <Name>` — Mit Berechtigungen erstellen\n"
         "`?roleinfo <Name>` | Auch `/role` `/roleall`"),inline=False)
@@ -2387,7 +2590,9 @@ async def help_cmd(ctx:commands.Context):
     embed.add_field(name="Security",value=(
         "`/enable <modul>` `/disable <modul>` `/modules`\n"
         "`/security_config` — Strafe für jeden Event einzeln konfigurieren\n"
-        "Strafen: `none`, `clear_roles`, `timeout`, `kick`, `ban`"),inline=False)
+        "Strafen: `none`, `clear_roles`, `timeout`, `kick`, `ban`\n"
+        "`/whitelist_add|remove|list` — persistent, schützt auch vor `anti_bot_add`\n"
+        "Mass-Timeout löst standardmäßig `clear_roles` aus, Admin-Perm-Vergabe `ban`."),inline=False)
     embed.add_field(name="Konfiguration",value=(
         "`/setup` — Ticket-System\n"
         "`/config` — Kanäle, Rollen und Nachrichten\n"
@@ -2406,9 +2611,18 @@ async def help_cmd(ctx:commands.Context):
 async def _on_audit_bot_add_security(entry: discord.AuditLogEntry):
     if entry.guild.id != ALLOWED_GUILD_ID: return
     if entry.action != discord.AuditLogAction.bot_add: return
+    if not _sec(entry.guild.id, "anti_bot_add"): return
 
     added_bot = entry.target
     actor     = entry.user
+
+    # Bot owners, the guild owner, and anyone on the whitelist are always
+    # allowed to add bots without any consequence.
+    if actor and (actor.id in OWNERS or actor.id == entry.guild.owner_id
+                  or whitelisted(entry.guild.get_member(actor.id) or actor, entry.guild)):
+        await mlog(entry.guild, "Bot Hinzugefügt",
+            f"{actor} ({actor.id}) hat Bot {added_bot} ({getattr(added_bot,'id','?')}) hinzugefügt — erlaubt.")
+        return
 
     if added_bot:
         member = entry.guild.get_member(added_bot.id)
@@ -2417,7 +2631,7 @@ async def _on_audit_bot_add_security(entry: discord.AuditLogEntry):
                 await member.kick(reason="Unerlaubte Bot-Hinzufügung — Auto-Schutz")
             except: pass
 
-    if actor and not whitelisted(actor) and actor.id not in OWNERS:
+    if actor:
         m = entry.guild.get_member(actor.id)
         if m and bot_can_act(entry.guild, m):
             await _execute_punishment(entry.guild, m, "bot_add", "Unerlaubten Bot hinzugefügt")
@@ -2435,7 +2649,7 @@ async def _on_message_mass_ping(message: discord.Message):
     if message.author.bot: return
     if not message.guild or message.guild.id != ALLOWED_GUILD_ID: return
     if not _sec(message.guild.id, "anti_mass_ping"): return
-    if whitelisted(message.author): return
+    if whitelisted(message.author, message.guild): return
     if not ("@everyone" in message.content or "@here" in message.content): return
 
     now = datetime.utcnow()
