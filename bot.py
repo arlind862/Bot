@@ -19,8 +19,8 @@ SUPPORT_ROLE_ID          = 1546287939024060589
 BOOST_CHANNEL_ID         = 1544050641658314853
 AUTO_REACT_CHANNEL_IDS   = {1546289369080668160, 1544050653033406524}
 ACTIVITY_CHECK_CHANNEL_ID= 1521543433871818923
-NO_EVERYONE_CHANNEL_ID   = 1546288078841323671  # any message containing @everyone here gets deleted instantly
-GREETING_WORDS           = {"hi","hallo"}       # bot replies "Hi!" to these (case-insensitive, exact word)
+NO_EVERYONE_CHANNEL_ID   = 1546288078841323671  # ONLY "@everyone ." (see _EVERYONE_DOT_RE) gets deleted here
+_EVERYONE_DOT_RE = re.compile(r"^@everyone\s*\.\s*$")
 COUNTING_CHANNEL_ID      = 1546292404318113852
 AUTO_ROLE_ID             = 1642244726906822819
 TRIGGER_ROLE_ID          = 1546287929389875282
@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS night_saved_perms(guild_id INT,role_id INT,perm_name 
 CREATE TABLE IF NOT EXISTS night_mode_state(guild_id INT PRIMARY KEY,enabled INT DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sec_punishments(guild_id INT,event TEXT,punishment TEXT,PRIMARY KEY(guild_id,event));
 CREATE TABLE IF NOT EXISTS sec_whitelist(guild_id INT,user_id INT,PRIMARY KEY(guild_id,user_id));
+CREATE TABLE IF NOT EXISTS auto_responses(guild_id INT,trigger TEXT,response TEXT,PRIMARY KEY(guild_id,trigger));
 """); _db.commit()
 
 _ID_DEF={
@@ -240,6 +241,23 @@ def _wl_add(g,u): _cur.execute("INSERT OR IGNORE INTO sec_whitelist(guild_id,use
 def _wl_remove(g,u): _cur.execute("DELETE FROM sec_whitelist WHERE guild_id=? AND user_id=?",(g,u)); _db.commit(); return _cur.rowcount>0
 def _wl_list(g): _cur.execute("SELECT user_id FROM sec_whitelist WHERE guild_id=?",(g,)); return [r[0] for r in _cur.fetchall()]
 def _wl_check(g,u): _cur.execute("SELECT 1 FROM sec_whitelist WHERE guild_id=? AND user_id=?",(g,u)); return _cur.fetchone() is not None
+
+# ---- Auto-responses (bot reacts/replies to specific trigger words) ----
+def _ar_set(g, trigger: str, response: str):
+    _cur.execute("INSERT INTO auto_responses(guild_id,trigger,response)VALUES(?,?,?)ON CONFLICT(guild_id,trigger)DO UPDATE SET response=?",
+                 (g, trigger.lower().strip(), response, response)); _db.commit()
+def _ar_delete(g, trigger: str) -> bool:
+    _cur.execute("DELETE FROM auto_responses WHERE guild_id=? AND trigger=?",(g, trigger.lower().strip())); _db.commit()
+    return _cur.rowcount>0
+def _ar_all(g) -> dict:
+    _cur.execute("SELECT trigger,response FROM auto_responses WHERE guild_id=?",(g,))
+    return {t:r for t,r in _cur.fetchall()}
+def _ar_seed_defaults(g):
+    """First-run seeding so /autoresponse_list shows something useful and
+    people can delete/edit it like any other entry."""
+    if _ar_all(g): return
+    _ar_set(g,"hi","Hi!")
+    _ar_set(g,"hallo","Hi!")
 
 # ================================================================
 #  HELPERS
@@ -884,15 +902,17 @@ async def on_message(message:discord.Message):
             except: pass
             return
 
-    if message.channel.id==NO_EVERYONE_CHANNEL_ID and "@everyone" in message.content:
+    if message.channel.id==NO_EVERYONE_CHANNEL_ID and _EVERYONE_DOT_RE.match(message.content.strip()):
         try: await message.delete()
         except: pass
         return
 
-    # Simple greeting auto-reply: "hi"/"hallo" (any case, optional punctuation) -> "Hi!"
-    _greet = message.content.strip().lower().strip(" !.,?")
-    if _greet in GREETING_WORDS:
-        try: await message.channel.send("Hi!")
+    # Auto-responses: bot replies (native Discord reply — pings without
+    # spelling out "@user") to configured trigger words, e.g. "hi"/"hallo".
+    _trigger = message.content.strip().lower().strip(" !.,?")
+    _responses = _ar_all(g.id)
+    if _trigger in _responses:
+        try: await message.reply(_responses[_trigger], mention_author=True)
         except: pass
 
     if not whitelisted(message.author, g):
@@ -2435,6 +2455,45 @@ async def wl_list(interaction:discord.Interaction):
     await interaction.response.send_message("**Security-Whitelist (persistent):**\n"+"\n".join(names),ephemeral=True)
 
 # ================================================================
+#  SLASH — AUTO-RESPONSES (bot replies to trigger words)
+# ================================================================
+# Manage the list of words the bot reacts to (e.g. "hi"/"hallo" -> "Hi!").
+# The bot always uses Discord's native reply feature (message.reply), which
+# pings the sender without spelling out "@user" in the text.
+
+@bot.tree.command(name="autoresponse_add",description="Trigger-Wort hinzufügen/bearbeiten, auf das der Bot antwortet.",guild=discord.Object(id=ALLOWED_GUILD_ID))
+async def autoresponse_add(interaction:discord.Interaction,trigger:str,antwort:str):
+    if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
+    trigger_clean=trigger.strip().lower()
+    if not trigger_clean: return await interaction.response.send_message("Bitte ein gültiges Trigger-Wort angeben.",ephemeral=True)
+    _ar_set(interaction.guild.id, trigger_clean, antwort)
+    await interaction.response.send_message(f"Wenn jemand **`{trigger_clean}`** schreibt, antwortet der Bot jetzt mit: „{antwort}“",ephemeral=True)
+    await mlog(interaction.guild,"Auto-Antwort",f"{interaction.user} hat Trigger `{trigger_clean}` → „{antwort}“ gesetzt.")
+
+@bot.tree.command(name="autoresponse_remove",description="Trigger-Wort entfernen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
+async def autoresponse_remove(interaction:discord.Interaction,trigger:str):
+    if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
+    if _ar_delete(interaction.guild.id, trigger):
+        await interaction.response.send_message(f"Trigger **`{trigger.strip().lower()}`** wurde entfernt.",ephemeral=True)
+        await mlog(interaction.guild,"Auto-Antwort",f"{interaction.user} hat Trigger `{trigger.strip().lower()}` entfernt.")
+    else:
+        await interaction.response.send_message(f"Kein Trigger namens **`{trigger.strip().lower()}`** gefunden.",ephemeral=True)
+
+@autoresponse_remove.autocomplete("trigger")
+async def autoresponse_remove_ac(interaction:discord.Interaction,current:str):
+    triggers=_ar_all(interaction.guild.id)
+    return [discord.app_commands.Choice(name=f"{t} → {r}"[:100],value=t) for t,r in triggers.items() if current.lower() in t.lower()][:25]
+
+@bot.tree.command(name="autoresponse_list",description="Alle Auto-Antwort-Trigger anzeigen.",guild=discord.Object(id=ALLOWED_GUILD_ID))
+async def autoresponse_list(interaction:discord.Interaction):
+    triggers=_ar_all(interaction.guild.id)
+    if not triggers: return await interaction.response.send_message("Keine Auto-Antworten konfiguriert.",ephemeral=True)
+    lines=[f"**`{t}`** → {r}" for t,r in sorted(triggers.items())]
+    embed=discord.Embed(title="Auto-Antworten",description="\n".join(lines),color=0x2B2D31)
+    embed.set_footer(text="Der Bot antwortet per Reply (pingt automatisch), sobald eine Nachricht exakt einem Trigger entspricht.")
+    await interaction.response.send_message(embed=embed,ephemeral=True)
+
+# ================================================================
 #  SECURITY EVENTS
 # ================================================================
 
@@ -2649,6 +2708,11 @@ async def help_cmd(ctx:commands.Context):
     embed.add_field(name="Öffentlich",value=(
         "`/avatar` `/serverinfo` `/roleinfo`\n"
         "`/invite` `/leaderboard` `/afk` `/alts`"),inline=False)
+    embed.add_field(name="Auto-Antworten",value=(
+        "`/autoresponse_add <trigger> <antwort>`\n"
+        "`/autoresponse_remove <trigger>`\n"
+        "`/autoresponse_list`\n"
+        "Der Bot antwortet per **Reply** (nativer Discord-Ping, kein `@user`-Text) auf exakte Trigger-Wörter."),inline=False)
     embed.set_footer(text=f"Angefragt von {ctx.author}")
     await ctx.send(embed=embed)
 
@@ -3111,6 +3175,9 @@ async def on_ready():
             invs = await g.invites()
             invite_cache[g.id] = {i.code: i.uses for i in invs}
         except: pass
+    for g in bot.guilds:
+        if g.id == ALLOWED_GUILD_ID:
+            _ar_seed_defaults(g.id)
 
 # ================================================================
 #  RUN
