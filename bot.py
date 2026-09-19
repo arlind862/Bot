@@ -19,6 +19,8 @@ SUPPORT_ROLE_ID          = 1546287939024060589
 BOOST_CHANNEL_ID         = 1544050641658314853
 AUTO_REACT_CHANNEL_IDS   = {1546289369080668160, 1544050653033406524}
 ACTIVITY_CHECK_CHANNEL_ID= 1521543433871818923
+NO_EVERYONE_CHANNEL_ID   = 1546288078841323671  # any message containing @everyone here gets deleted instantly
+GREETING_WORDS           = {"hi","hallo"}       # bot replies "Hi!" to these (case-insensitive, exact word)
 COUNTING_CHANNEL_ID      = 1546292404318113852
 AUTO_ROLE_ID             = 1642244726906822819
 TRIGGER_ROLE_ID          = 1546287929389875282
@@ -334,9 +336,9 @@ def bot_can_act(guild, member):
 # ================================================================
 #  ENGLISH TRANSLATION — 🇺🇸 button helper
 # ================================================================
-# Every message the bot sends can carry a small 🇺🇸 button. Pressing it
-# translates the same content to English and replies ephemerally, so the
-# original message in the channel stays untouched.
+# /send messages can carry a small 🇺🇸 button. Pressing it translates the
+# same content to English and replies ephemerally, so the original message
+# in the channel stays untouched. Only /send uses this (by request).
 
 async def _translate_text(text: str) -> str | None:
     if not text: return None
@@ -733,7 +735,7 @@ async def voice_loop():
                         try: await vc.disconnect(force=True)
                         except: pass
                     try:
-                        await ch.connect(reconnect=True, timeout=30, self_deaf=True)
+                        await ch.connect(reconnect=True, timeout=30, self_deaf=False)
                     except Exception as e:
                         print(f"[voice] connect failed: {e}")
                 elif vc.channel and vc.channel.id != ch.id:
@@ -755,7 +757,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if ch:
             await asyncio.sleep(2)
             try:
-                await ch.connect(reconnect=True, timeout=30, self_deaf=True)
+                await ch.connect(reconnect=True, timeout=30, self_deaf=False)
             except: pass
 
 @bot.event
@@ -797,8 +799,7 @@ async def on_member_join(member:discord.Member):
             raw=_cmsg(member.guild.id,"WELCOME_MSG")
             desc=raw.format(mention=member.mention,rules=_cid(member.guild.id,"RULES_CHANNEL_ID"))
             emb=discord.Embed(description=desc,color=0x2B2D31)
-            view=TranslateView(embed=emb)
-            await wch.send(embed=emb,view=view,
+            await wch.send(embed=emb,
                 allowed_mentions=discord.AllowedMentions(users=True))
         except: pass
 
@@ -823,7 +824,7 @@ async def on_member_join(member:discord.Member):
                     description=_cmsg(member.guild.id,"INVITE_UNKNOWN_MSG").format(member=str(member),mention=member.mention),
                     color=0x2B2D31,timestamp=datetime.utcnow())
             emb.set_thumbnail(url=member.display_avatar.url)
-            await ich.send(embed=emb,view=TranslateView(embed=emb),allowed_mentions=discord.AllowedMentions(users=True))
+            await ich.send(embed=emb,allowed_mentions=discord.AllowedMentions(users=True))
     except: pass
 
 @bot.event
@@ -854,7 +855,7 @@ async def on_member_update(before:discord.Member,after:discord.Member):
             try:
                 await asyncio.sleep(5)
                 text=_cmsg(after.guild.id,"BOOST_MSG")
-                await ch.send(text,view=TranslateView(text=text))
+                await ch.send(text)
             except: pass
     b={r.id for r in before.roles}; a={r.id for r in after.roles}
     tr=_cid(after.guild.id,"TRIGGER_ROLE_ID")
@@ -883,6 +884,17 @@ async def on_message(message:discord.Message):
             except: pass
             return
 
+    if message.channel.id==NO_EVERYONE_CHANNEL_ID and "@everyone" in message.content:
+        try: await message.delete()
+        except: pass
+        return
+
+    # Simple greeting auto-reply: "hi"/"hallo" (any case, optional punctuation) -> "Hi!"
+    _greet = message.content.strip().lower().strip(" !.,?")
+    if _greet in GREETING_WORDS:
+        try: await message.channel.send("Hi!")
+        except: pass
+
     if not whitelisted(message.author, g):
         now=datetime.utcnow()
         if _sec(g.id,"anti_spam"):
@@ -898,7 +910,7 @@ async def on_message(message:discord.Message):
                 except: pass
                 try:
                     warn_txt=f"{message.author.mention} Du wurdest wegen Spam bestraft."
-                    await message.channel.send(warn_txt,delete_after=8,view=TranslateView(text="You were punished for spamming."))
+                    await message.channel.send(warn_txt,delete_after=8)
                 except: pass
                 spam_tracker[message.author.id].clear()
                 await mlog(g,"Auto-Strafe (Spam)",f"{message.author} ({message.author.id}) — Spam erkannt.")
@@ -934,7 +946,7 @@ async def on_message(message:discord.Message):
             return
 
     if message.channel.id in AUTO_REACT_CHANNEL_IDS:
-        emoji="✅" if message.channel.id==ACTIVITY_CHECK_CHANNEL_ID else "✔"
+        emoji="✅" if message.channel.id==ACTIVITY_CHECK_CHANNEL_ID else "✔️"
         try: await message.add_reaction(emoji)
         except: pass
 
@@ -986,7 +998,7 @@ async def handle_counting(message:discord.Message):
             try: await counting_state["delete_notice"].delete()
             except: pass
             counting_state["delete_notice"]=None
-        try: await message.add_reaction("✔")
+        try: await message.add_reaction("✔️")
         except: pass
     else:
         try:
@@ -1004,7 +1016,7 @@ async def on_reaction_add(reaction:discord.Reaction,user:discord.User):
     first_react_announced.add(mid)
     try:
         msg = _cmsg(reaction.message.guild.id,"FIRST_REACT_MSG").format(mention=user.mention,user=str(user))
-        await reaction.message.channel.send(msg,view=TranslateView(text=msg),allowed_mentions=discord.AllowedMentions(users=True))
+        await reaction.message.channel.send(msg,allowed_mentions=discord.AllowedMentions(users=True))
     except: pass
 
 # ================================================================
@@ -1038,9 +1050,7 @@ class TicketActionView(View):
             embed = discord.Embed(
                 description=close_text,
                 color=0x2B2D31)
-            view=TicketDeleteView()
-            add_translate(view, text=close_text)
-            await interaction.channel.send(embed=embed, view=view)
+            await interaction.channel.send(embed=embed, view=TicketDeleteView())
         except Exception as e:
             await interaction.followup.send(f"Ein Fehler ist aufgetreten: {e}", ephemeral=True)
 
@@ -1115,10 +1125,8 @@ class TicketButton(View):
             )
             embed.set_footer(text=f"Geöffnet von {interaction.user}", icon_url=interaction.user.display_avatar.url)
             pings = f"{sr.mention} {interaction.user.mention}" if sr else interaction.user.mention
-            ticket_view=TicketActionView()
-            add_translate(ticket_view, text=open_msg)
             await tc.send(
-                content=pings, embed=embed, view=ticket_view,
+                content=pings, embed=embed, view=TicketActionView(),
                 allowed_mentions=discord.AllowedMentions(roles=True, users=True))
             await interaction.response.send_message(
                 f"Dein Ticket wurde erstellt: {tc.mention}", ephemeral=True)
@@ -1243,10 +1251,8 @@ class SetupMainView(discord.ui.View):
                 return await interaction.response.edit_message(embed=embed, view=_BackToSetupView(g.id))
             panel_desc = _cmsg(g.id, "TICKET_PANEL_DESC")
             embed = discord.Embed(title="Support", description=panel_desc, color=0x2B2D31)
-            panel_view=TicketButton()
-            add_translate(panel_view, text=panel_desc)
             try:
-                await ch.send(embed=embed, view=panel_view)
+                await ch.send(embed=embed, view=TicketButton())
                 await _return_to_setup(interaction, f"Ticket-Panel wurde in {ch.mention} gesendet.")
             except Exception as e:
                 await interaction.response.send_message(f"Fehler: {e}", ephemeral=True)
@@ -1597,7 +1603,7 @@ async def kick(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kei
     try:
         await member.kick(reason=f"{ctx.author}: {reason}")
         txt=f"**{member}** wurde von **{ctx.author.name}** gekickt. | {reason}"
-        await ctx.send(txt,view=TranslateView(text=txt))
+        await ctx.send(txt)
         await mlog(ctx.guild,"Kick",f"{ctx.author} hat {member} ({member.id}) gekickt. Grund: {reason}")
     except discord.Forbidden: await ctx.send("Ich habe keine Berechtigung, diese Person zu kicken.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
@@ -1612,7 +1618,7 @@ async def ban(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kein
     try:
         await member.ban(reason=f"{ctx.author}: {reason}",delete_message_days=1)
         txt=f"**{member}** wurde von **{ctx.author.name}** gebannt. | {reason}"
-        await ctx.send(txt,view=TranslateView(text=txt))
+        await ctx.send(txt)
         await mlog(ctx.guild,"Ban",f"{ctx.author} hat {member} ({member.id}) gebannt. Grund: {reason}")
     except discord.Forbidden: await ctx.send("Ich habe keine Berechtigung, diese Person zu bannen.")
     except Exception as e: await ctx.send(f"Fehler: {e}")
@@ -1650,7 +1656,7 @@ async def timeout(ctx:commands.Context,member:discord.Member=None,duration:str=N
         until=discord.utils.utcnow()+timedelta(seconds=secs)
         await member.timeout(until,reason=f"{ctx.author}: {reason}")
         txt=f"**{member}** wurde für **{duration}** getimeouted. | {reason}"
-        await ctx.send(txt,view=TranslateView(text=txt))
+        await ctx.send(txt)
         await mlog(ctx.guild,"Timeout",f"{ctx.author} hat {member} ({member.id}) für {duration} getimeouted.")
         await _track_mass_timeout(ctx.guild, ctx.author)
     except discord.Forbidden: await ctx.send("Keine Berechtigung.")
@@ -1675,7 +1681,7 @@ async def warn(ctx:commands.Context,member:discord.Member=None,*,reason:str="Kei
     if not member: return await clean(ctx,"Verwendung: `?warn @user [Grund]`")
     wid=_warn_add(ctx.guild.id,member.id,ctx.author.id,reason); wl=_warn_get(ctx.guild.id,member.id)
     txt=f"**{member}** wurde verwarnt (#{wid}, gesamt: {len(wl)}). | {reason}"
-    await ctx.send(txt,view=TranslateView(text=txt))
+    await ctx.send(txt)
     await mlog(ctx.guild,"Verwarnung",f"{ctx.author} hat {member} ({member.id}) verwarnt — #{wid}. {reason}")
     try:
         await member.send(embed=discord.Embed(title=f"Verwarnung — {ctx.guild.name}",
@@ -1780,9 +1786,30 @@ class RoleCreateView(discord.ui.View):
     async def cancel(self,interaction:discord.Interaction,button:discord.ui.Button): await interaction.response.edit_message(content="Abgebrochen.",view=None)
 
 # ---- ?role @user (no role given) -> multi-role picker ----
-class RoleMultiSelect(discord.ui.RoleSelect):
-    def __init__(self, author_id: int, member: discord.Member):
-        super().__init__(placeholder="Rollen auswählen (Hinzufügen/Entfernen toggeln)...", min_values=1, max_values=25)
+# Only shows roles the invoking staff member is actually allowed to hand out:
+# below the bot's top role, below their own top role, and no admin roles
+# unless they're a bot owner. (E.g. someone whose highest role is "Co-Boss"
+# only ever sees roles up to — but not including — Co-Boss.)
+def _assignable_roles(guild: discord.Guild, author: discord.Member) -> list[discord.Role]:
+    roles=[]
+    for r in guild.roles:
+        if r.is_default(): continue
+        if guild.me and r >= guild.me.top_role: continue
+        if author.id not in OWNERS:
+            if r.permissions.administrator: continue
+            if r >= author.top_role: continue
+        roles.append(r)
+    roles.sort(key=lambda r: r.position, reverse=True)
+    return roles[:25]  # Discord select menus cap out at 25 options
+
+class RoleMultiSelect(discord.ui.Select):
+    def __init__(self, author_id: int, member: discord.Member, roles: list[discord.Role]):
+        options=[discord.SelectOption(
+            label=r.name[:100], value=str(r.id),
+            description="Wird entfernt" if r in member.roles else "Wird hinzugefügt"
+        ) for r in roles]
+        super().__init__(placeholder="Rollen auswählen (Hinzufügen/Entfernen toggeln)...",
+                          min_values=1, max_values=len(options), options=options)
         self.author_id = author_id
         self.member = member
 
@@ -1790,7 +1817,9 @@ class RoleMultiSelect(discord.ui.RoleSelect):
         if interaction.user.id != self.author_id:
             return await interaction.response.send_message("Dieses Menü ist nicht für dich.", ephemeral=True)
         added=[]; removed=[]; failed=[]
-        for role in self.values:
+        for rid in self.values:
+            role = interaction.guild.get_role(int(rid))
+            if not role: continue
             if role >= interaction.guild.me.top_role:
                 failed.append(f"{role.name} (zu hoch für mich)"); continue
             if role.permissions.administrator and interaction.user.id not in OWNERS:
@@ -1809,16 +1838,27 @@ class RoleMultiSelect(discord.ui.RoleSelect):
         parts=[]
         if added: parts.append("✅ Hinzugefügt: " + ", ".join(added))
         if removed: parts.append("➖ Entfernt: " + ", ".join(removed))
-        if failed: parts.append("⚠ Fehlgeschlagen: " + ", ".join(failed))
+        if failed: parts.append("⚠️ Fehlgeschlagen: " + ", ".join(failed))
+        if self.view: self.view.stop()
         await interaction.response.edit_message(content="\n".join(parts) or "Keine Änderung.", view=None)
         if added or removed:
             await mlog(interaction.guild, "Rollen Menü",
                 f"{interaction.user} hat für {self.member} Rollen angepasst — Hinzugefügt: {', '.join(added) or '—'} | Entfernt: {', '.join(removed) or '—'}")
 
 class RoleMultiSelectView(discord.ui.View):
-    def __init__(self, author_id: int, member: discord.Member):
-        super().__init__(timeout=120)
-        self.add_item(RoleMultiSelect(author_id, member))
+    """1-minute picker. If nobody picks anything in that time, the message
+    deletes itself instead of sitting around uselessly."""
+    def __init__(self, author: discord.Member, member: discord.Member):
+        super().__init__(timeout=60)
+        self.message: discord.Message | None = None
+        roles = _assignable_roles(author.guild, author)
+        if roles:
+            self.add_item(RoleMultiSelect(author.id, member, roles))
+
+    async def on_timeout(self):
+        if self.message:
+            try: await self.message.delete()
+            except: pass
 
 @bot.command(name="role")
 async def role_cmd(ctx:commands.Context,member:discord.Member=None,*,role_input:str=None):
@@ -1826,8 +1866,12 @@ async def role_cmd(ctx:commands.Context,member:discord.Member=None,*,role_input:
     if not can_role(ctx.author): return await clean(ctx,"Keine Berechtigung.")
     if not member: return await clean(ctx,"Verwendung: `?role @user [Rollenname oder ID]` — ohne Rolle öffnet sich eine Auswahl.")
     if not role_input:
-        view = RoleMultiSelectView(ctx.author.id, member)
-        await ctx.send(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest:", view=view)
+        assignable = _assignable_roles(ctx.guild, ctx.author)
+        if not assignable:
+            return await clean(ctx,"Du hast keine Rollen, die du vergeben kannst.")
+        view = RoleMultiSelectView(ctx.author, member)
+        msg = await ctx.send(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest (läuft in 60s ab):", view=view)
+        view.message = msg
         return
     matches=find_role(ctx.guild,role_input)
     if not matches: return await clean(ctx,f"Keine Rolle gefunden: **{role_input}**.")
@@ -1960,7 +2004,7 @@ async def call(ctx:commands.Context):
     try:
         vc=ctx.voice_client
         if vc and vc.is_connected(): await vc.move_to(ch)
-        else: await ch.connect(reconnect=True,timeout=30,self_deaf=True)
+        else: await ch.connect(reconnect=True,timeout=30,self_deaf=False)
         await ctx.send("Verbunden.",delete_after=3)
     except Exception as e: await ctx.send(f"Fehler: {e}")
 
@@ -2131,8 +2175,12 @@ async def slash_slowmode(interaction:discord.Interaction,seconds:int,channel:dis
 async def slash_role(interaction:discord.Interaction,member:discord.Member,role:discord.Role=None):
     if not can_role(interaction.user): return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     if role is None:
-        view = RoleMultiSelectView(interaction.user.id, member)
-        await interaction.response.send_message(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest:", view=view)
+        assignable = _assignable_roles(interaction.guild, interaction.user)
+        if not assignable:
+            return await interaction.response.send_message("Du hast keine Rollen, die du vergeben kannst.", ephemeral=True)
+        view = RoleMultiSelectView(interaction.user, member)
+        await interaction.response.send_message(f"Wähle die Rollen aus, die du für {member.mention} hinzufügen oder entfernen möchtest (läuft in 60s ab):", view=view)
+        view.message = await interaction.original_response()
         return
     if role>=interaction.guild.me.top_role: return await interaction.response.send_message("Diese Rolle ist gleich oder höher als meine höchste Rolle.",ephemeral=True)
     if role.permissions.administrator and interaction.user.id not in OWNERS: return await interaction.response.send_message("Du kannst keine Admin-Rollen vergeben.",ephemeral=True)
@@ -2357,7 +2405,7 @@ async def send_cmd(interaction:discord.Interaction,channel:discord.TextChannel,m
 async def say_cmd(interaction:discord.Interaction,channel:discord.TextChannel,text:str):
     if interaction.user.id not in OWNERS: return await interaction.response.send_message("Keine Berechtigung.",ephemeral=True)
     try:
-        await channel.send(text,view=TranslateView(text=text)); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
+        await channel.send(text); await interaction.response.send_message("Nachricht gesendet.",ephemeral=True)
     except discord.Forbidden: await interaction.response.send_message("Keine Berechtigung in diesem Kanal.",ephemeral=True)
     except Exception as e: await interaction.response.send_message(f"Fehler: {e}",ephemeral=True)
 
